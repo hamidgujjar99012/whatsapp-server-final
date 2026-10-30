@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-server-final",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "firebase": "^10.12.2",
+    "node-cron": "^3.0.3",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.3"
+  }
+}
