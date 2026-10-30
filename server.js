@@ -26,7 +26,8 @@ const db = getFirestore(firebaseApp);
 
 async function loginBot() {
     try {
-        await signInWithEmailAndPassword(auth, "BOT_EMAIL_YAHAN_DALEIN", "BOT_PASSWORD_YAHAN_DALEIN");
+        // YAHAN APNA EMAIL AUR PASSWORD DALEIN (Neeche wali lines mein)
+        await signInWithEmailAndPassword(auth, "bot@videozone.com", "BotPassword123!");
         console.log("🤖 Bot successfully logged into Firebase!");
     } catch (error) {
         console.error("❌ Bot login failed:", error.message);
@@ -93,7 +94,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Send fail' }); }
 });
 
-// Naya Disconnect Route (Ban hone par kaam aayega)
+// Naya Disconnect Route
 app.post('/api/whatsapp/disconnect/:ispId', async (req, res) => {
     const { ispId } = req.params;
     if (sessions.has(ispId)) {
