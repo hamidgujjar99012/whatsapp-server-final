@@ -32,7 +32,10 @@ const firebaseConfig = {
 
 const firebaseApp = initializeApp(firebaseConfig);
 const auth = getAuth(firebaseApp);
-const db = getFirestore(firebaseApp);
+const db = initializeFirestore(firebaseApp, {
+  experimentalAutoDetectLongPolling: true,
+  useFetchStreams: false,
+});
 
 async function ensureBotLogin() {
   try {
