@@ -1,135 +1,212 @@
 const express = require('express');
 const cors = require('cors');
-const qrcode = require('qrcode');
-const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
+const QRCode = require('qrcode');
 const cron = require('node-cron');
-const { initializeApp } = require('firebase/app');
-const { getAuth, signInWithEmailAndPassword } = require('firebase/auth');
-const { getFirestore, collection, getDocs } = require('firebase/firestore');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const admin = require('firebase-admin');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 
-// --- FIREBASE CONFIG ---
-const firebaseConfig = {
-  apiKey: "AIzaSyAbOSA-JI8yrJDJBScsiQxnohWOLowyGTY",
-  authDomain: "quick-layout-pmn89.firebaseapp.com",
-  projectId: "quick-layout-pmn89",
-  storageBucket: "quick-layout-pmn89.firebasestorage.app",
-  messagingSenderId: "111040364657",
-  appId: "1:111040364657:web:570feb58b15db4ea9d9bd0"
-};
-
-const firebaseApp = initializeApp(firebaseConfig);
-const auth = getAuth(firebaseApp);
-const db = getFirestore(firebaseApp); 
-
-async function loginBot() {
-    try {
-        // YAHAN APNA EMAIL AUR PASSWORD DALEIN (Neeche wali lines mein)
-        await signInWithEmailAndPassword(auth, "bot@videozone.com", "BotPassword123!");
-        console.log("🤖 Bot successfully logged into Firebase!");
-    } catch (error) {
-        console.error("❌ Bot login failed:", error.message);
-    }
-}
-loginBot();
-
-// --- EXPRESS SETUP ---
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
 
-const sessions = new Map();
+// ---------- Firebase (Bot account) ----------
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)),
+  });
+}
+const db = admin.firestore();
 
-async function connectToWhatsApp(ispId) {
-    if (sessions.has(ispId) && sessions.get(ispId).isConnected) return sessions.get(ispId).sock;
-    const sessionDir = path.join(__dirname, 'sessions', ispId);
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
-    const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: 'silent' }) });
+// ---------- Session folder (Railway Volume yahan mount karo: /app/sessions) ----------
+const SESSIONS_ROOT = '/app/sessions';
+if (!fs.existsSync(SESSIONS_ROOT)) fs.mkdirSync(SESSIONS_ROOT, { recursive: true });
 
-    sessions.set(ispId, { sock, isConnected: false, qr: null });
+const sessions = {}; // har ISP ka alag WhatsApp connection yahan store hoga
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) sessions.get(ispId).qr = await qrcode.toDataURL(qr);
-        if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            sessions.get(ispId).isConnected = false;
-            if (shouldReconnect) setTimeout(() => connectToWhatsApp(ispId), 3000);
-            else { fs.rmSync(sessionDir, { recursive: true, force: true }); sessions.delete(ispId); }
-        } else if (connection === 'open') {
-            sessions.get(ispId).isConnected = true;
-            sessions.get(ispId).qr = null;
-        }
-    });
-    sock.ev.on('creds.update', saveCreds);
-    return sock;
+function getSessionDir(ispId) {
+  return path.join(SESSIONS_ROOT, ispId);
+}
+function clearSessionFolder(ispId) {
+  const dir = getSessionDir(ispId);
+  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
 }
 
-// --- API ROUTES ---
-app.get('/api/whatsapp/qr/:ispId', async (req, res) => {
-    const { ispId } = req.params;
-    if (sessions.has(ispId) && sessions.get(ispId).isConnected) return res.json({ status: 'connected' });
-    if (!sessions.has(ispId)) { await connectToWhatsApp(ispId); await new Promise(r => setTimeout(r, 2000)); }
-    const session = sessions.get(ispId);
-    res.json(session?.qr ? { status: 'qr', qr: session.qr } : { status: 'initializing' });
-});
+async function startSocketForIsp(ispId, { forceFresh = false } = {}) {
+  if (sessions[ispId]?.connecting) return;
+  if (forceFresh) clearSessionFolder(ispId);
 
-app.get('/api/whatsapp/status/:ispId', (req, res) => {
-    res.json({ connected: sessions.get(req.params.ispId)?.isConnected || false });
-});
+  sessions[ispId] = { ...(sessions[ispId] || {}), connecting: true, status: 'connecting', qr: null };
 
-app.post('/api/whatsapp/send', async (req, res) => {
-    const { ispId, phone, message, imageBase64 } = req.body;
-    if (!sessions.has(ispId) || !sessions.get(ispId).isConnected) return res.status(400).json({ error: 'Not connected' });
-    let cleanPhone = phone.replace(/\D/g, '');
-    if (cleanPhone.startsWith('0')) cleanPhone = '92' + cleanPhone.slice(1);
-    const jid = `${cleanPhone}@s.whatsapp.net`;
-    try {
-        if (imageBase64) await sessions.get(ispId).sock.sendMessage(jid, { image: Buffer.from(imageBase64.split(',')[1], 'base64'), caption: message });
-        else await sessions.get(ispId).sock.sendMessage(jid, { text: message });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Send fail' }); }
-});
+  const { state, saveCreds } = await useMultiFileAuthState(getSessionDir(ispId));
+  const { version } = await fetchLatestBaileysVersion();
 
-// Naya Disconnect Route
-app.post('/api/whatsapp/disconnect/:ispId', async (req, res) => {
-    const { ispId } = req.params;
-    if (sessions.has(ispId)) {
-        const session = sessions.get(ispId);
-        try { await session.sock.logout(); } catch (e) {}
-        const sessionDir = path.join(__dirname, 'sessions', ispId);
-        try { if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
-        sessions.delete(ispId);
-        return res.json({ success: true, message: 'Disconnected successfully' });
+  const sock = makeWASocket({ version, auth: state, browser: ['VIDEO ZONE', 'Chrome', '1.0.0'] });
+  sessions[ispId].sock = sock;
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      sessions[ispId].qr = qr;
+      sessions[ispId].status = 'qr';
+      console.log(`[${ispId}] Naya QR ban gaya ✅`);
     }
-    res.json({ success: true, message: 'Already disconnected' });
+
+    if (connection === 'open') {
+      sessions[ispId].status = 'connected';
+      sessions[ispId].qr = null;
+      sessions[ispId].connecting = false;
+      console.log(`[${ispId}] WhatsApp connect ho gaya 🎉`);
+      await db.collection('isps').doc(ispId).set({ whatsappConnected: true }, { merge: true });
+    }
+
+    if (connection === 'close') {
+      sessions[ispId].connecting = false;
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const loggedOut = code === DisconnectReason.loggedOut;
+      const badSession = code === DisconnectReason.badSession;
+
+      await db.collection('isps').doc(ispId).set({ whatsappConnected: false }, { merge: true });
+
+      if (loggedOut || badSession) {
+        // Purani kharab session apne aap delete ho jayegi, next baar fresh QR milega
+        clearSessionFolder(ispId);
+        sessions[ispId].status = 'disconnected';
+        sessions[ispId].qr = null;
+      } else {
+        startSocketForIsp(ispId); // thoda sa net issue tha, dobara try karo
+      }
+    }
+  });
+}
+
+// ---------- Status check ----------
+app.get('/api/whatsapp/status/:ispId', (req, res) => {
+  const s = sessions[req.params.ispId];
+  res.json({ connected: s?.status === 'connected', status: s?.status || 'disconnected' });
 });
 
-// --- CRON JOB (3-Day Reminders) ---
-cron.schedule('0 10 * * *', async () => {
-    if (!auth.currentUser) await loginBot();
+// ---------- QR laane wala endpoint ----------
+app.get('/api/whatsapp/qr/:ispId', async (req, res) => {
+  const { ispId } = req.params;
+  try {
+    if (!sessions[ispId] || sessions[ispId].status === 'disconnected') {
+      await startSocketForIsp(ispId);
+    }
+    for (let i = 0; i < 20; i++) {
+      if (sessions[ispId]?.status === 'connected') return res.json({ connected: true });
+      if (sessions[ispId]?.qr) {
+        const qrImage = await QRCode.toDataURL(sessions[ispId].qr);
+        return res.json({ connected: false, qr: qrImage });
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    res.status(504).json({ error: 'QR nahi bana, reset button try karein' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Reset button (agar atak jaye to isko call karo) ----------
+app.post('/api/whatsapp/reset/:ispId', async (req, res) => {
+  const { ispId } = req.params;
+  try {
+    if (sessions[ispId]?.sock) try { sessions[ispId].sock.end(undefined); } catch (_) {}
+    delete sessions[ispId];
+    clearSessionFolder(ispId);
+    await startSocketForIsp(ispId, { forceFresh: true });
+    res.json({ message: 'Reset ho gaya, naya QR tayar ho raha hai' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Phone number ko sahi format mein badalna ----------
+function normalizePhoneToJid(rawPhone, defaultCountryCode = '92') { // Pakistan = 92, India = 91
+  let digits = rawPhone.replace(/\D/g, '');
+  digits = digits.replace(/^0+/, '');
+  if (digits.length === 10) digits = defaultCountryCode + digits;
+  return `${digits}@s.whatsapp.net`;
+}
+
+async function sendWhatsAppMessage(ispId, rawPhone, message) {
+  const sock = sessions[ispId]?.sock;
+  if (!sock || sessions[ispId].status !== 'connected') throw new Error('WhatsApp connected nahi hai');
+
+  const jid = normalizePhoneToJid(rawPhone);
+  const [check] = await sock.onWhatsApp(jid);
+  if (!check?.exists) throw new Error('Ye number WhatsApp par nahi hai: ' + rawPhone);
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-        const targetDate = new Date(); targetDate.setDate(targetDate.getDate() + 3);
-        const targetStr = targetDate.toISOString().slice(0, 10);
-        const snap = await getDocs(collection(db, 'customers'));
-        for (const doc of snap.docs) {
-            const c = doc.data();
-            if (c.expiryDate === targetStr && (c.status === 'Active' || c.paymentStatus === 'Unpaid')) {
-                const isp = c.operator_id;
-                if (sessions.has(isp) && sessions.get(isp).isConnected) {
-                    let p = c.phone.replace(/\D/g, '');
-                    if (p.startsWith('0')) p = '92' + p.slice(1);
-                    await sessions.get(isp).sock.sendMessage(`${p}@s.whatsapp.net`, { text: `Dear ${c.fullName}, your package expires on ${c.expiryDate}. Please pay Rs. ${c.outstandingBalance || c.monthlyFee}.` });
-                }
-            }
-        }
-    } catch (err) { console.error(err); }
+      await sock.sendMessage(check.jid, { text: message });
+      return true;
+    } catch (err) {
+      if (attempt === 3) throw err;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+}
+
+// ---------- "Mark as Paid" => Auto Receipt ----------
+app.post('/api/whatsapp/send-receipt', async (req, res) => {
+  const { ispId, customerId, amount, planName, paidDate } = req.body;
+  try {
+    const custSnap = await db.collection('isps').doc(ispId).collection('customers').doc(customerId).get();
+    if (!custSnap.exists) return res.status(404).json({ error: 'Customer nahi mila' });
+    const c = custSnap.data();
+
+    const msg =
+`✅ *Payment Mil Gayi*
+Hi ${c.name}, aapki payment receive ho gayi hai.
+
+Plan: ${planName}
+Amount: Rs. ${amount}
+Date: ${paidDate}
+
+Shukriya - VIDEO ZONE 🙌`;
+
+    await sendWhatsAppMessage(ispId, c.phone, msg);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ---------- Auto Reminder: 4 din pehle ----------
+cron.schedule('0 10 * * *', async () => { // roz subah 10 baje check karega
+  const ispsSnap = await db.collection('isps').get();
+  for (const ispDoc of ispsSnap.docs) {
+    const ispId = ispDoc.id;
+    if (sessions[ispId]?.status !== 'connected') continue;
+
+    const fourDaysLater = Date.now() + 4 * 24 * 60 * 60 * 1000;
+    const customersSnap = await db.collection('isps').doc(ispId).collection('customers')
+      .where('expiryDate', '<=', fourDaysLater)
+      .where('expiryDate', '>=', Date.now())
+      .get();
+
+    for (const custDoc of customersSnap.docs) {
+      const c = custDoc.data();
+      try {
+        await sendWhatsAppMessage(ispId, c.phone,
+          `⏰ Hi ${c.name}, aapka VIDEO ZONE plan (${c.planName}) 4 din mein expire ho raha hai. Waqt par renew kar lein warna connection band ho jayega.`);
+      } catch (err) {
+        console.log('Reminder fail:', c.phone, err.message);
+      }
+    }
+  }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server 24/7 Mode par chal raha hai. Port: ${PORT}`);
-});
+app.listen(PORT, () => console.log('Server chal raha hai port', PORT));
