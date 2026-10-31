@@ -7,7 +7,7 @@ const cron = require('node-cron');
 const pino = require('pino');
 const { initializeApp } = require('firebase/app');
 const { getAuth, signInWithEmailAndPassword } = require('firebase/auth');
-const { getFirestore, collection, doc, getDoc, getDocs, query, where, setDoc } = require('firebase/firestore');
+const { initializeFirestore, collection, doc, getDoc, getDocs, query, where, setDoc } = require('firebase/firestore');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
